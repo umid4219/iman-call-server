@@ -1,5 +1,5 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from datetime import datetime, timedelta
 import os
@@ -63,7 +63,6 @@ async def upload_call(
     file: UploadFile = File(None)
 ):
     try:
-        # Добавляем 5 часов к текущему серверному времени (UTC -> UTC+5)
         local_now = datetime.utcnow() + timedelta(hours=5)
         current_time_str = local_now.strftime('%Y-%m-%d %H:%M:%S')
         
@@ -89,7 +88,6 @@ async def upload_call(
         except ValueError:
             duration_sec = 0
 
-        # Корректируем время звонка с телефона с учетом +5 часов
         call_dt = datetime.utcfromtimestamp(date_timestamp / 1000) + timedelta(hours=5)
 
         calls = load_data()
@@ -115,6 +113,21 @@ async def upload_call(
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/delete-employee/{emp_name}")
+async def delete_employee(emp_name: str):
+    # Удаляем звонки сотрудника
+    calls = load_data()
+    calls = [c for c in calls if c['employee'] != emp_name]
+    save_data(calls)
+    
+    # Удаляем статус связи
+    sync_status = load_sync_status()
+    if emp_name in sync_status:
+        del sync_status[emp_name]
+        save_sync_status(sync_status)
+        
+    return RedirectResponse(url="/", status_code=303)
 
 def filter_calls(calls, employee, date, call_type, min_duration):
     filtered = calls
@@ -157,6 +170,14 @@ async def get_dashboard(employee: str = "all", date: str = None, call_type: str 
         selected = 'selected' if emp == employee else ''
         emp_options += f'<option value="{emp}" {selected}>{emp} (Связь: {last_seen})</option>'
 
+    # Блок с кнопками удаления сотрудников под фильтрами
+    delete_buttons_html = ""
+    if employees:
+        delete_buttons_html = '<div style="margin-top: 15px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center;"><span style="font-size: 11px; color: #d4af37; font-weight: bold;">УДАЛИТЬ СОТРУДНИКА:</span>'
+        for emp in employees:
+            delete_buttons_html += f'<a href="/delete-employee/{emp}" onclick="return confirm(\'Удалить сотрудника {emp} и все его данные?\');" class="btn-delete">{emp} ✕</a>'
+        delete_buttons_html += '</div>'
+
     ct_all = 'selected' if call_type == 'all' else ''
     ct_in = 'selected' if call_type == 'Входящий' else ''
     ct_out = 'selected' if call_type == 'Исходящий' else ''
@@ -188,6 +209,8 @@ async def get_dashboard(employee: str = "all", date: str = None, call_type: str 
             select, input[type="date"] {{ background: #181310; color: #d4af37; border: 1px solid #4a3b2c; padding: 10px 15px; border-radius: 6px; font-size: 14px; }}
             .btn {{ background: #d4af37; color: #12100e; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: bold; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; }}
             .btn-secondary {{ background: #181310; color: #d4af37; border: 1px solid #4a3b2c; }}
+            .btn-delete {{ background: #2a1515; color: #e74c3c; border: 1px solid #5c2626; padding: 5px 10px; border-radius: 4px; font-size: 12px; text-decoration: none; font-weight: bold; display: inline-flex; align-items: center; gap: 5px; }}
+            .btn-delete:hover {{ background: #3d1a1a; }}
             table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
             th, td {{ padding: 14px 16px; text-align: left; border-bottom: 1px solid #2a221b; font-size: 14px; }}
             th {{ background-color: #1f1814; color: #d4af37; font-size: 11px; text-transform: uppercase; }}
@@ -222,7 +245,7 @@ async def get_dashboard(employee: str = "all", date: str = None, call_type: str 
                     <div class="filter-group">
                         <label>МИН. ДЛИТЕЛЬНОСТЬ</label>
                         <select name="min_duration">
-                            любые <option value="0" {dur_0}>Любая</option>
+                            <option value="0" {dur_0}>Любая</option>
                             <option value="10" {dur_10}>От 10 сек</option>
                             <option value="30" {dur_30}>От 30 сек</option>
                             <option value="60" {dur_60}>От 1 мин</option>
@@ -234,6 +257,7 @@ async def get_dashboard(employee: str = "all", date: str = None, call_type: str 
                         <a href="/download-report?employee={employee}&date={date if date else ''}&call_type={call_type}&min_duration={min_duration}" class="btn" style="margin-left: 15px;">Скачать Excel</a>
                     </div>
                 </form>
+                {delete_buttons_html}
             </div>
             
             <div class="card">
