@@ -63,7 +63,9 @@ async def upload_call(
     file: UploadFile = File(None)
 ):
     try:
-        current_time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        # Добавляем 5 часов к текущему серверному времени (UTC -> UTC+5)
+        local_now = datetime.utcnow() + timedelta(hours=5)
+        current_time_str = local_now.strftime('%Y-%m-%d %H:%M:%S')
         
         sync_status = load_sync_status()
         sync_status[employee] = current_time_str
@@ -82,14 +84,23 @@ async def upload_call(
         if call_type.lower() == "пропущенный":
             duration = "0"
 
+        try:
+            duration_sec = int(float(duration))
+        except ValueError:
+            duration_sec = 0
+
+        # Корректируем время звонка с телефона с учетом +5 часов
+        call_dt = datetime.utcfromtimestamp(date_timestamp / 1000) + timedelta(hours=5)
+
         calls = load_data()
         new_call = {
             "employee": employee,
             "number": number,
+            "duration_seconds": duration_sec,
             "duration_formatted": format_duration(duration),
             "type": call_type,
             "timestamp": date_timestamp,
-            "datetime": datetime.fromtimestamp(date_timestamp / 1000).strftime('%Y-%m-%d %H:%M:%S'),
+            "datetime": call_dt.strftime('%Y-%m-%d %H:%M:%S'),
             "audio_url": file_path
         }
         
@@ -97,7 +108,7 @@ async def upload_call(
         if not exists:
             calls.insert(0, new_call)
         
-        cutoff_time = (datetime.now() - timedelta(hours=48)).timestamp() * 1000
+        cutoff_time = (datetime.utcnow() + timedelta(hours=5) - timedelta(hours=48)).timestamp() * 1000
         calls = [c for c in calls if c["timestamp"] >= cutoff_time]
         
         save_data(calls)
@@ -105,19 +116,25 @@ async def upload_call(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+def filter_calls(calls, employee, date, call_type, min_duration):
+    filtered = calls
+    if employee != "all":
+        filtered = [c for c in filtered if c['employee'] == employee]
+    if date:
+        filtered = [c for c in filtered if c['datetime'].startswith(date)]
+    if call_type != "all":
+        filtered = [c for c in filtered if c['type'].lower() == call_type.lower()]
+    if min_duration > 0:
+        filtered = [c for c in filtered if c.get('duration_seconds', 0) >= min_duration]
+    return filtered
+
 @app.get("/", response_class=HTMLResponse)
-async def get_dashboard(employee: str = "all", date: str = None, call_type: str = "all"):
+async def get_dashboard(employee: str = "all", date: str = None, call_type: str = "all", min_duration: int = 0):
     calls = load_data()
     sync_status = load_sync_status()
     employees = sorted(list(set(c['employee'] for c in calls).union(sync_status.keys())))
     
-    filtered_calls = calls
-    if employee != "all":
-        filtered_calls = [c for c in filtered_calls if c['employee'] == employee]
-    if date:
-        filtered_calls = [c for c in filtered_calls if c['datetime'].startswith(date)]
-    if call_type != "all":
-        filtered_calls = [c for c in filtered_calls if c['type'].lower() == call_type.lower()]
+    filtered_calls = filter_calls(calls, employee, date, call_type, min_duration)
 
     rows_html = "".join([f"""
         <tr>
@@ -144,6 +161,11 @@ async def get_dashboard(employee: str = "all", date: str = None, call_type: str 
     ct_in = 'selected' if call_type == 'Входящий' else ''
     ct_out = 'selected' if call_type == 'Исходящий' else ''
     ct_miss = 'selected' if call_type == 'Пропущенный' else ''
+
+    dur_0 = 'selected' if min_duration == 0 else ''
+    dur_10 = 'selected' if min_duration == 10 else ''
+    dur_30 = 'selected' if min_duration == 30 else ''
+    dur_60 = 'selected' if min_duration == 60 else ''
 
     html_content = f"""
     <!DOCTYPE html>
@@ -197,10 +219,19 @@ async def get_dashboard(employee: str = "all", date: str = None, call_type: str 
                             <option value="Пропущенный" {ct_miss}>Пропущенные</option>
                         </select>
                     </div>
+                    <div class="filter-group">
+                        <label>МИН. ДЛИТЕЛЬНОСТЬ</label>
+                        <select name="min_duration">
+                            любые <option value="0" {dur_0}>Любая</option>
+                            <option value="10" {dur_10}>От 10 сек</option>
+                            <option value="30" {dur_30}>От 30 сек</option>
+                            <option value="60" {dur_60}>От 1 мин</option>
+                        </select>
+                    </div>
                     <div style="display: flex; gap: 10px; align-items: flex-end; margin-top: 18px;">
                         <button type="submit" class="btn">Применить</button>
                         <a href="/" class="btn btn-secondary">Сброс</a>
-                        <a href="/download-report" class="btn" style="margin-left: 15px;">Скачать Excel</a>
+                        <a href="/download-report?employee={employee}&date={date if date else ''}&call_type={call_type}&min_duration={min_duration}" class="btn" style="margin-left: 15px;">Скачать Excel</a>
                     </div>
                 </form>
             </div>
@@ -222,11 +253,15 @@ async def get_dashboard(employee: str = "all", date: str = None, call_type: str 
     return html_content
 
 @app.get("/download-report")
-async def download_report():
+async def download_report(employee: str = "all", date: str = None, call_type: str = "all", min_duration: int = 0):
     calls = load_data()
-    if not calls: raise HTTPException(status_code=404, detail="Нет данных")
-    df = pd.DataFrame(calls)
+    filtered_calls = filter_calls(calls, employee, date, call_type, min_duration)
+    
+    if not filtered_calls: 
+        raise HTTPException(status_code=404, detail="Нет данных по выбранным фильтрам")
+    
+    df = pd.DataFrame(filtered_calls)
     df = df[['datetime', 'employee', 'number', 'type', 'duration_formatted']]
     df.columns = ['Дата и время', 'Сотрудник', 'Номер', 'Тип', 'Длительность']
     df.to_excel("data/iman_call_report.xlsx", index=False)
-    return FileResponse("data/iman_call_report.xlsx", filename="IMAN_Call_Report_48h.xlsx")
+    return FileResponse("data/iman_call_report.xlsx", filename="IMAN_Call_Report_Filtered.xlsx")
