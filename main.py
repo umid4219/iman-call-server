@@ -3,6 +3,7 @@ from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from datetime import datetime, timedelta
 from html import escape
+from zoneinfo import ZoneInfo
 import os
 import json
 import re
@@ -10,6 +11,7 @@ import pandas as pd
 from urllib.parse import urlencode
 
 app = FastAPI()
+TASHKENT_TZ = ZoneInfo("Asia/Tashkent")
 
 RECORDINGS_DIR = "recordings"
 DATA_FILE = "data/calls_data.json"
@@ -169,8 +171,18 @@ def render_call_item(call):
     """
 
 
-def render_employee_card(employee, calls, sync_status, date=None, call_type="all", min_duration=0):
-    stats = employee_statistics(calls, employee)
+def render_employee_card(
+    employee,
+    calls,
+    sync_status,
+    date=None,
+    call_type="all",
+    min_duration=0,
+    summary_calls=None,
+):
+    # The list can be filtered, but the employee header must always show
+    # the complete breakdown for the selected employee/date.
+    stats = employee_statistics(summary_calls if summary_calls is not None else calls, employee)
     employee_html = escape(str(employee))
     employee_calls = sorted(calls, key=lambda c: c.get("timestamp", 0), reverse=True)
     calls_html = "".join(render_call_item(call) for call in employee_calls)
@@ -209,7 +221,7 @@ def render_employee_card(employee, calls, sync_status, date=None, call_type="all
             <div class="employee-details">
                 <div class="calls-heading">
                     <span>Звонки сотрудника</span>
-                    <span>{stats["total"]} записей</span>
+                    <span>{len(employee_calls)} записей по фильтру</span>
                 </div>
                 <div class="detail-toolbar">
                     <span>Фильтр длительности:</span>
@@ -244,7 +256,7 @@ async def upload_call(
 ):
     # Android integration contract is intentionally unchanged.
     try:
-        current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        current_time_str = datetime.now(TASHKENT_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
         sync_status = load_sync_status()
         sync_status[employee] = current_time_str
@@ -270,7 +282,9 @@ async def upload_call(
             "duration_formatted": format_duration(duration),
             "type": call_type,
             "timestamp": date_timestamp,
-            "datetime": datetime.fromtimestamp(date_timestamp / 1000).strftime("%Y-%m-%d %H:%M:%S"),
+            "datetime": datetime.fromtimestamp(
+                date_timestamp / 1000, tz=TASHKENT_TZ
+            ).strftime("%Y-%m-%d %H:%M:%S"),
             "audio_url": file_path,
         }
 
@@ -278,7 +292,7 @@ async def upload_call(
         if not exists:
             calls.insert(0, new_call)
 
-        cutoff_time = (datetime.now() - timedelta(hours=48)).timestamp() * 1000
+        cutoff_time = (datetime.now(TASHKENT_TZ) - timedelta(hours=48)).timestamp() * 1000
         calls = deduplicate_calls([c for c in calls if c["timestamp"] >= cutoff_time])
 
         save_data(calls)
@@ -309,11 +323,17 @@ async def get_dashboard(
     sync_status = load_sync_status()
     employees = sorted(list(set(c.get("employee", "Сотрудник") for c in calls).union(sync_status.keys())))
 
-    filtered_calls = calls
+    # Employee/date define the full scope shown in the summary.
+    summary_calls = calls
     if employee != "all":
-        filtered_calls = [c for c in filtered_calls if c.get("employee") == employee]
+        summary_calls = [c for c in summary_calls if c.get("employee") == employee]
     if date:
-        filtered_calls = [c for c in filtered_calls if str(c.get("datetime", "")).startswith(date)]
+        summary_calls = [
+            c for c in summary_calls if str(c.get("datetime", "")).startswith(date)
+        ]
+
+    # Type and duration affect only the expanded call list.
+    filtered_calls = summary_calls
     if call_type != "all":
         filtered_calls = [
             c for c in filtered_calls if str(c.get("type", "")).lower() == call_type.lower()
@@ -328,6 +348,9 @@ async def get_dashboard(
     selected_calls_by_employee = {
         emp: [c for c in filtered_calls if c.get("employee") == emp] for emp in employees
     }
+    summary_calls_by_employee = {
+        emp: [c for c in summary_calls if c.get("employee") == emp] for emp in employees
+    }
     visible_employees = employees if employee == "all" else [employee]
     cards_html = "".join(
         render_employee_card(
@@ -337,6 +360,7 @@ async def get_dashboard(
             date=date,
             call_type=call_type,
             min_duration=min_duration,
+            summary_calls=summary_calls_by_employee.get(emp, []),
         )
         for emp in visible_employees
         if emp in employees
@@ -344,18 +368,18 @@ async def get_dashboard(
     if not cards_html:
         cards_html = '<div class="empty-state">Нет сотрудников по выбранным фильтрам</div>'
 
-    total_stats = employee_statistics(filtered_calls, "__all__")
-    total_stats["total"] = len(filtered_calls)
+    total_stats = employee_statistics(summary_calls, "__all__")
+    total_stats["total"] = len(summary_calls)
     total_stats["incoming"] = sum(
-        1 for c in filtered_calls if str(c.get("type", "")).lower() == "входящий"
+        1 for c in summary_calls if str(c.get("type", "")).lower() == "входящий"
     )
     total_stats["outgoing"] = sum(
-        1 for c in filtered_calls if str(c.get("type", "")).lower() == "исходящий"
+        1 for c in summary_calls if str(c.get("type", "")).lower() == "исходящий"
     )
     total_stats["missed"] = sum(
-        1 for c in filtered_calls if str(c.get("type", "")).lower() == "пропущенный"
+        1 for c in summary_calls if str(c.get("type", "")).lower() == "пропущенный"
     )
-    total_seconds = sum(duration_to_seconds(c.get("duration_formatted")) for c in filtered_calls)
+    total_seconds = sum(duration_to_seconds(c.get("duration_formatted")) for c in summary_calls)
     total_stats["duration"] = format_total_duration(total_seconds)
 
     html_content = f"""
