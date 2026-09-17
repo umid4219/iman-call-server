@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from datetime import datetime, timedelta
 from html import escape
@@ -7,6 +7,7 @@ import os
 import json
 import re
 import pandas as pd
+from urllib.parse import urlencode
 
 app = FastAPI()
 
@@ -19,11 +20,38 @@ os.makedirs("data", exist_ok=True)
 app.mount("/recordings", StaticFiles(directory=RECORDINGS_DIR), name="recordings")
 
 
+def call_dedupe_key(call):
+    """Treat two records from the same employee/number in the same second as one call."""
+    timestamp = call.get("timestamp")
+    try:
+        timestamp = int(timestamp)
+        second = timestamp // 1000 if timestamp > 10_000_000_000 else timestamp
+    except (TypeError, ValueError):
+        second = str(call.get("datetime", ""))[:19]
+    return (
+        str(call.get("employee", "")).strip().lower(),
+        str(call.get("number", "")).strip(),
+        second,
+    )
+
+
+def deduplicate_calls(calls):
+    unique_calls = []
+    seen = set()
+    for call in calls:
+        key = call_dedupe_key(call)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_calls.append(call)
+    return unique_calls
+
+
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             try:
-                return json.load(f)
+                return deduplicate_calls(json.load(f))
             except json.JSONDecodeError:
                 return []
     return []
@@ -95,6 +123,17 @@ def connection_label(value):
     return value if value else "Нет данных"
 
 
+def filter_url(employee, date=None, call_type="all", min_duration=0):
+    params = {"employee": employee}
+    if date:
+        params["date"] = date
+    if call_type != "all":
+        params["call_type"] = call_type
+    if min_duration:
+        params["min_duration"] = str(min_duration)
+    return "/?" + urlencode(params)
+
+
 def employee_statistics(calls, employee):
     employee_calls = [c for c in calls if c.get("employee") == employee]
     incoming = sum(1 for c in employee_calls if str(c.get("type", "")).lower() == "входящий")
@@ -130,7 +169,7 @@ def render_call_item(call):
     """
 
 
-def render_employee_card(employee, calls, sync_status):
+def render_employee_card(employee, calls, sync_status, date=None, call_type="all", min_duration=0):
     stats = employee_statistics(calls, employee)
     employee_html = escape(str(employee))
     employee_calls = sorted(calls, key=lambda c: c.get("timestamp", 0), reverse=True)
@@ -138,8 +177,18 @@ def render_employee_card(employee, calls, sync_status):
     if not calls_html:
         calls_html = '<div class="empty-state compact">Нет звонков по выбранным фильтрам</div>'
 
+    all_calls_url = filter_url(employee, date)
+    incoming_url = filter_url(employee, date, "Входящий")
+    outgoing_url = filter_url(employee, date, "Исходящий")
+    missed_url = filter_url(employee, date, "Пропущенный")
+    duration_all_url = filter_url(employee, date, call_type)
+    duration_10_url = filter_url(employee, date, call_type, min_duration=10)
+    duration_30_url = filter_url(employee, date, call_type, min_duration=30)
+    delete_name = escape(str(employee), quote=True)
+    open_attribute = " open" if call_type != "all" or min_duration else ""
+
     return f"""
-        <details class="employee-card" data-employee="{employee_html}">
+        <details class="employee-card" data-employee="{employee_html}"{open_attribute}>
             <summary>
                 <span class="employee-main">
                     <span class="employee-avatar">{employee_html[:1].upper()}</span>
@@ -149,10 +198,10 @@ def render_employee_card(employee, calls, sync_status):
                     </span>
                 </span>
                 <span class="employee-metrics">
-                    <span class="metric total"><b>{stats["total"]}</b><em>всего</em></span>
-                    <span class="metric incoming"><b>{stats["incoming"]}</b><em>входящих</em></span>
-                    <span class="metric outgoing"><b>{stats["outgoing"]}</b><em>исходящих</em></span>
-                    <span class="metric missed"><b>{stats["missed"]}</b><em>пропущенных</em></span>
+                    <a href="{all_calls_url}" class="metric total" title="Показать все звонки сотрудника"><b>{stats["total"]}</b><em>всего</em></a>
+                    <a href="{incoming_url}" class="metric incoming" title="Показать входящие"><b>{stats["incoming"]}</b><em>входящих</em></a>
+                    <a href="{outgoing_url}" class="metric outgoing" title="Показать исходящие"><b>{stats["outgoing"]}</b><em>исходящих</em></a>
+                    <a href="{missed_url}" class="metric missed" title="Показать пропущенные"><b>{stats["missed"]}</b><em>пропущенных</em></a>
                     <span class="metric duration"><b>{escape(stats["duration"])}</b><em>разговоры</em></span>
                 </span>
                 <span class="chevron" aria-hidden="true">⌄</span>
@@ -161,6 +210,16 @@ def render_employee_card(employee, calls, sync_status):
                 <div class="calls-heading">
                     <span>Звонки сотрудника</span>
                     <span>{stats["total"]} записей</span>
+                </div>
+                <div class="detail-toolbar">
+                    <span>Фильтр длительности:</span>
+                    <a class="duration-filter {"active" if min_duration == 0 else ""}" href="{duration_all_url}">Все</a>
+                    <a class="duration-filter {"active" if min_duration == 10 else ""}" href="{duration_10_url}">от 10 сек</a>
+                    <a class="duration-filter {"active" if min_duration == 30 else ""}" href="{duration_30_url}">от 30 сек</a>
+                    <form method="post" action="/delete-employee" class="delete-form" onsubmit="return confirm('Удалить сотрудника и все его звонки?');">
+                        <input type="hidden" name="employee" value="{delete_name}">
+                        <button type="submit" class="delete-button">Удалить сотрудника</button>
+                    </form>
                 </div>
                 <div class="calls-list">
                     <div class="call-row call-head">
@@ -215,17 +274,12 @@ async def upload_call(
             "audio_url": file_path,
         }
 
-        exists = any(
-            c["employee"] == employee
-            and c["timestamp"] == date_timestamp
-            and c["number"] == number
-            for c in calls
-        )
+        exists = any(call_dedupe_key(c) == call_dedupe_key(new_call) for c in calls)
         if not exists:
             calls.insert(0, new_call)
 
         cutoff_time = (datetime.now() - timedelta(hours=48)).timestamp() * 1000
-        calls = [c for c in calls if c["timestamp"] >= cutoff_time]
+        calls = deduplicate_calls([c for c in calls if c["timestamp"] >= cutoff_time])
 
         save_data(calls)
         return {"status": "success"}
@@ -233,8 +287,24 @@ async def upload_call(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/delete-employee")
+async def delete_employee(employee: str = Form(...)):
+    """Delete an employee, their calls and their last connection marker."""
+    calls = [c for c in load_data() if c.get("employee") != employee]
+    sync_status = load_sync_status()
+    sync_status.pop(employee, None)
+    save_data(calls)
+    save_sync_status(sync_status)
+    return RedirectResponse(url="/", status_code=303)
+
+
 @app.get("/", response_class=HTMLResponse)
-async def get_dashboard(employee: str = "all", date: str = None, call_type: str = "all"):
+async def get_dashboard(
+    employee: str = "all",
+    date: str = None,
+    call_type: str = "all",
+    min_duration: int = 0,
+):
     calls = load_data()
     sync_status = load_sync_status()
     employees = sorted(list(set(c.get("employee", "Сотрудник") for c in calls).union(sync_status.keys())))
@@ -248,6 +318,11 @@ async def get_dashboard(employee: str = "all", date: str = None, call_type: str 
         filtered_calls = [
             c for c in filtered_calls if str(c.get("type", "")).lower() == call_type.lower()
         ]
+    if min_duration:
+        filtered_calls = [
+            c for c in filtered_calls
+            if duration_to_seconds(c.get("duration_formatted")) >= min_duration
+        ]
     filtered_calls = sorted(filtered_calls, key=lambda c: c.get("timestamp", 0), reverse=True)
 
     selected_calls_by_employee = {
@@ -255,24 +330,20 @@ async def get_dashboard(employee: str = "all", date: str = None, call_type: str 
     }
     visible_employees = employees if employee == "all" else [employee]
     cards_html = "".join(
-        render_employee_card(emp, selected_calls_by_employee.get(emp, []), sync_status)
+        render_employee_card(
+            emp,
+            selected_calls_by_employee.get(emp, []),
+            sync_status,
+            date=date,
+            call_type=call_type,
+            min_duration=min_duration,
+        )
         for emp in visible_employees
         if emp in employees
     )
     if not cards_html:
         cards_html = '<div class="empty-state">Нет сотрудников по выбранным фильтрам</div>'
 
-    employee_options = '<option value="all">Все сотрудники</option>'
-    for emp in employees:
-        selected = "selected" if emp == employee else ""
-        employee_options += f'<option value="{escape(emp, quote=True)}" {selected}>{escape(emp)}</option>'
-
-    type_options = f"""
-        <option value="all" {"selected" if call_type == "all" else ""}>Все типы звонков</option>
-        <option value="Входящий" {"selected" if call_type == "Входящий" else ""}>Входящие</option>
-        <option value="Исходящий" {"selected" if call_type == "Исходящий" else ""}>Исходящие</option>
-        <option value="Пропущенный" {"selected" if call_type == "Пропущенный" else ""}>Пропущенные</option>
-    """
     total_stats = employee_statistics(filtered_calls, "__all__")
     total_stats["total"] = len(filtered_calls)
     total_stats["incoming"] = sum(
@@ -286,17 +357,6 @@ async def get_dashboard(employee: str = "all", date: str = None, call_type: str 
     )
     total_seconds = sum(duration_to_seconds(c.get("duration_formatted")) for c in filtered_calls)
     total_stats["duration"] = format_total_duration(total_seconds)
-
-    filter_query = "&".join(
-        part
-        for part in [
-            f"employee={escape(employee, quote=True)}" if employee != "all" else "",
-            f"date={escape(date, quote=True)}" if date else "",
-            f"call_type={escape(call_type, quote=True)}" if call_type != "all" else "",
-        ]
-        if part
-    )
-    refresh_url = f"/?{filter_query}" if filter_query else "/"
 
     html_content = f"""
     <!DOCTYPE html>
@@ -325,8 +385,6 @@ async def get_dashboard(employee: str = "all", date: str = None, call_type: str 
             h1 {{ color: var(--gold); font-size: clamp(22px, 3vw, 34px); letter-spacing: 1px; margin: 0; text-transform: uppercase; }}
             .sub-title {{ color: #c39b2c; font-size: 14px; margin-top: 7px; }}
             .signature {{ color: #80652e; font-size: 11px; margin-top: 6px; font-style: italic; }}
-            .live-status {{ color: var(--muted); display: flex; gap: 9px; align-items: center; white-space: nowrap; font-size: 12px; padding-top: 7px; }}
-            .live-dot {{ width: 9px; height: 9px; border-radius: 50%; background: var(--green); box-shadow: 0 0 12px var(--green); }}
             .card {{ background: rgba(25, 20, 16, .92); border: 1px solid var(--border); border-radius: 14px; box-shadow: 0 14px 45px rgba(0,0,0,.18); }}
             .filters {{ display: flex; gap: 12px; align-items: end; flex-wrap: wrap; padding: 18px; }}
             .filter-group {{ display: flex; flex-direction: column; gap: 7px; min-width: 185px; flex: 1; }}
@@ -357,13 +415,18 @@ async def get_dashboard(employee: str = "all", date: str = None, call_type: str 
             .employee-main small {{ display:block; color: var(--muted); font-size: 10px; margin-top: 5px; }}
             .employee-avatar {{ display:flex; align-items:center; justify-content:center; width: 36px; height:36px; border-radius: 10px; background: rgba(212,175,55,.13); color: var(--gold); font-weight: 800; }}
             .employee-metrics {{ display: flex; align-items: stretch; gap: 2px; }}
-            .metric {{ min-width: 78px; padding: 0 13px; border-left: 1px solid var(--border); text-align: center; }}
+            .metric {{ min-width: 78px; padding: 0 13px; border-left: 1px solid var(--border); text-align: center; text-decoration: none; cursor: pointer; }}
             .metric b {{ display:block; font-size: 17px; color: var(--text); }} .metric em {{ color: var(--muted); font-size: 10px; font-style: normal; white-space: nowrap; }}
             .metric.incoming b {{ color: var(--green); }} .metric.outgoing b {{ color: var(--blue); }} .metric.missed b {{ color: var(--red); }} .metric.duration b {{ color: var(--gold); font-size: 13px; padding-top: 2px; }}
+            .metric:hover b {{ filter: brightness(1.3); }} .metric.duration {{ cursor: default; }}
             .chevron {{ color: var(--gold); font-size: 22px; margin-left: 3px; transition: transform .2s; }} .employee-card[open] .chevron {{ transform: rotate(180deg); }}
             .employee-details {{ border-top: 1px solid var(--border); padding: 15px 18px 18px; background: rgba(13, 10, 8, .25); }}
             .calls-heading {{ display:flex; justify-content:space-between; color: var(--gold); font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 10px; }}
             .calls-heading span:last-child {{ color: var(--muted); font-weight: 500; text-transform: none; letter-spacing: 0; }}
+            .detail-toolbar {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:12px; color:var(--muted); font-size:11px; }}
+            .duration-filter {{ color:var(--gold); border:1px solid #55402a; border-radius:5px; padding:5px 8px; text-decoration:none; }}
+            .duration-filter:hover, .duration-filter.active {{ background:rgba(212,175,55,.14); border-color:var(--gold); }}
+            .delete-form {{ margin-left:auto; }} .delete-button {{ background:transparent; color:var(--red); border:1px solid rgba(239,108,99,.45); border-radius:5px; padding:5px 9px; cursor:pointer; font-size:11px; }} .delete-button:hover {{ background:rgba(239,108,99,.12); }}
             .calls-list {{ border: 1px solid var(--border); border-radius: 9px; overflow: hidden; }}
             .call-row {{ display:grid; grid-template-columns: 1.25fr 1.15fr .9fr .85fr 1.5fr; gap: 12px; align-items: center; padding: 12px 13px; border-top: 1px solid rgba(57,45,33,.7); font-size: 12px; }}
             .call-row:first-child {{ border-top: 0; }} .call-head {{ background: #211914; color: var(--gold); border: 0; font-size: 10px; text-transform: uppercase; font-weight: 800; }}
@@ -374,7 +437,7 @@ async def get_dashboard(employee: str = "all", date: str = None, call_type: str 
             .empty-state {{ color: var(--muted); text-align: center; padding: 45px 20px; background: rgba(25,20,16,.9); border: 1px dashed var(--border); border-radius: 12px; }} .empty-state.compact {{ padding: 24px; border: 0; }}
             footer {{ text-align:center; color:#786237; font-size:11px; padding: 0 0 25px; }}
             @media (max-width: 900px) {{ .overview {{ grid-template-columns: repeat(3, 1fr); }} .employee-card summary {{ align-items:flex-start; flex-wrap:wrap; }} .employee-main {{ min-width: 45%; }} .employee-metrics {{ width:100%; overflow:auto; padding-left:47px; }} .chevron {{ position:absolute; right: 20px; }} .employee-card {{ position:relative; }} }}
-            @media (max-width: 650px) {{ .container {{ width: calc(100% - 24px); padding-top: 22px; }} .header {{ display:block; }} .live-status {{ margin-top:15px; }} .overview {{ grid-template-columns: repeat(2, 1fr); }} .overview-item:nth-child(2) {{ border-right:0; }} .filters {{ padding: 13px; }} .filter-group {{ min-width: 100%; }} .filter-actions, .filter-actions .btn {{ width:100%; }} .call-head {{ display:none; }} .call-row {{ grid-template-columns: 1fr 1fr; gap: 8px; }} .call-recording {{ grid-column: 1 / -1; }} .metric {{ min-width: 70px; padding:0 9px; }} }}
+            @media (max-width: 650px) {{ .container {{ width: calc(100% - 24px); padding-top: 22px; }} .header {{ display:block; }} .overview {{ grid-template-columns: repeat(2, 1fr); }} .overview-item:nth-child(2) {{ border-right:0; }} .filters {{ padding: 13px; }} .filter-group {{ min-width: 100%; }} .filter-actions, .filter-actions .btn {{ width:100%; }} .call-head {{ display:none; }} .call-row {{ grid-template-columns: 1fr 1fr; gap: 8px; }} .call-recording {{ grid-column: 1 / -1; }} .metric {{ min-width: 70px; padding:0 9px; }} .delete-form {{ width:100%; margin-left:0; }} .delete-button {{ width:100%; }} }}
         </style>
     </head>
     <body>
@@ -385,16 +448,13 @@ async def get_dashboard(employee: str = "all", date: str = None, call_type: str 
                     <div class="sub-title">Журнал звонков · последние 48 часов</div>
                     <div class="signature">Architected &amp; Developed by Ravshanov</div>
                 </div>
-                <div class="live-status"><span class="live-dot"></span><span>Обновляется автоматически · 5 сек</span></div>
             </header>
 
             <section class="card">
                 <form method="get" action="/" class="filters">
-                    <div class="filter-group"><label for="employee">Сотрудник</label><select id="employee" name="employee">{employee_options}</select></div>
                     <div class="filter-group"><label for="date">Дата</label><input id="date" type="date" name="date" value="{escape(date or '', quote=True)}"></div>
-                    <div class="filter-group"><label for="call_type">Тип звонка</label><select id="call_type" name="call_type">{type_options}</select></div>
                     <div class="filter-actions">
-                        <button type="submit" class="btn">Применить</button>
+                        <button type="submit" class="btn">Показать за дату</button>
                         <a href="/" class="btn btn-secondary">Сбросить</a>
                         <a href="/download-report" class="btn btn-secondary">Скачать Excel</a>
                     </div>
@@ -410,26 +470,12 @@ async def get_dashboard(employee: str = "all", date: str = None, call_type: str 
             </section>
 
             <div class="section-head">
-                <div><h2>Сотрудники</h2><p>Нажмите на сотрудника, чтобы раскрыть только его звонки</p></div>
+                <div><h2>Сотрудники</h2><p>Нажмите на показатель входящих, исходящих или пропущенных звонков для фильтрации</p></div>
                 <p>Показано: {len(filtered_calls)} звонков</p>
             </div>
             <section class="employee-list">{cards_html}</section>
         </main>
         <footer>Architected &amp; Developed by Ravshanov &bull; IMAN Call Management System</footer>
-        <script>
-            (() => {{
-                const refreshUrl = {json.dumps(refresh_url, ensure_ascii=False)};
-                const opened = JSON.parse(sessionStorage.getItem("iman-open-employees") || "[]");
-                document.querySelectorAll(".employee-card").forEach((card) => {{
-                    if (opened.includes(card.dataset.employee)) card.open = true;
-                }});
-                setTimeout(() => {{
-                    const openEmployees = [...document.querySelectorAll(".employee-card[open]")].map((card) => card.dataset.employee);
-                    sessionStorage.setItem("iman-open-employees", JSON.stringify(openEmployees));
-                    window.location.href = refreshUrl;
-                }}, 5000);
-            }})();
-        </script>
     </body>
     </html>
     """
